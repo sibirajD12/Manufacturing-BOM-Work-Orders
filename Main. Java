@@ -1,0 +1,494 @@
+import java.util.*;
+import java.time.*;
+
+public class ManufacturingApp {
+    // ---------- Simple ID generators ----------
+    private static int productIdSeq = 1;
+    private static int bomIdSeq = 1;
+    private static int woIdSeq = 1;
+    private static int transIdSeq = 1;
+
+    // ---------- In-memory stores ----------
+    private static Map<Integer, Product> products = new HashMap<>();
+    private static Map<Integer, BOM> boms = new HashMap<>();
+    private static Map<Integer, WorkOrder> workOrders = new HashMap<>();
+    private static Warehouse warehouse = new Warehouse("Main Warehouse");
+
+    private static Scanner scanner = new Scanner(System.in);
+
+    // ---------- Main ----------
+    public static void main(String[] args) {
+        seedSampleData(); // optional sample data
+        while (true) {
+            printMenu();
+            String choice = scanner.nextLine().trim();
+            switch (choice) {
+                case "1": addProduct(); break;
+                case "2": defineBOM(); break;
+                case "3": createWorkOrder(); break;
+                case "4": issueMaterials(); break;
+                case "5": reportProduction(); break;
+                case "6": stockSummary(); break;
+                case "7": listWorkOrders(); break;
+                case "8": System.out.println("Exiting..."); return;
+                default: System.out.println("Invalid choice.");
+            }
+        }
+    }
+
+    // ---------- Menu helpers ----------
+    private static void printMenu() {
+        System.out.println("\n--- Manufacturing Console ---");
+        System.out.println("1) Add Product");
+        System.out.println("2) Define BOM");
+        System.out.println("3) Create Work Order");
+        System.out.println("4) Issue Materials");
+        System.out.println("5) Report Production");
+        System.out.println("6) Stock Summary");
+        System.out.println("7) List Work Orders (summary)");
+        System.out.println("8) Exit");
+        System.out.print("Choose: ");
+    }
+
+    // ---------- Menu actions ----------
+    private static void addProduct() {
+        System.out.print("Product name: ");
+        String name = scanner.nextLine().trim();
+        System.out.print("SKU: ");
+        String sku = scanner.nextLine().trim();
+        System.out.print("Description: ");
+        String desc = scanner.nextLine().trim();
+        Product p = new Product(productIdSeq++, name, sku, desc);
+        products.put(p.getId(), p);
+        System.out.println("Added product: " + p);
+        System.out.print("Add initial stock? (y/n): ");
+        if (scanner.nextLine().trim().equalsIgnoreCase("y")) {
+            System.out.print("Quantity to add: ");
+            int q = Integer.parseInt(scanner.nextLine().trim());
+            warehouse.receive(p, q);
+            System.out.println("Stock updated.");
+        }
+    }
+
+    private static void defineBOM() {
+        if (products.isEmpty()) {
+            System.out.println("No products exist. Add products first.");
+            return;
+        }
+        System.out.println("Select finished product by id:");
+        products.values().forEach(System.out::println);
+        System.out.print("Finished product id: ");
+        int pid = Integer.parseInt(scanner.nextLine().trim());
+        Product finished = products.get(pid);
+        if (finished == null) { System.out.println("Invalid product."); return; }
+
+        BOM bom = new BOM(bomIdSeq++, finished);
+        while (true) {
+            System.out.println("Available components:");
+            products.values().forEach(System.out::println);
+            System.out.print("Enter component id (or 0 to finish): ");
+            int cid = Integer.parseInt(scanner.nextLine().trim());
+            if (cid == 0) break;
+            if (!products.containsKey(cid)) { System.out.println("Invalid id."); continue; }
+            if (cid == finished.getId()) { System.out.println("Cannot add finished product as its own component."); continue; }
+
+            System.out.print("Qty per finished unit: ");
+            int qty = Integer.parseInt(scanner.nextLine().trim());
+            bom.addItem(new BOMItem(products.get(cid), qty));
+            System.out.println("Added BOM item.");
+        }
+        if (bom.getItems().isEmpty()) {
+            System.out.println("BOM must contain at least one item. Discarded.");
+            return;
+        }
+        boms.put(bom.getId(), bom);
+        System.out.println("BOM defined: " + bom);
+    }
+
+    private static void createWorkOrder() {
+        if (boms.isEmpty()) {
+            System.out.println("No BOMs exist. Define BOM first.");
+            return;
+        }
+        System.out.println("Available BOMs:");
+        boms.values().forEach(b -> System.out.println(b.briefString()));
+        System.out.print("Enter BOM id to use: ");
+        int bid = Integer.parseInt(scanner.nextLine().trim());
+        BOM bom = boms.get(bid);
+        if (bom == null) { System.out.println("Invalid BOM."); return; }
+        System.out.print("Quantity to produce: ");
+        int qty = Integer.parseInt(scanner.nextLine().trim());
+        WorkOrder wo = new WorkOrder(woIdSeq++, bom, qty);
+
+        // Attempt to reserve required components in warehouse (business rule 1)
+        boolean reservedAll = true;
+        Map<Product, Integer> needed = bom.totalComponentsFor(qty);
+        for (Map.Entry<Product, Integer> e : needed.entrySet()) {
+            Product comp = e.getKey();
+            int needQty = e.getValue();
+            boolean ok = warehouse.reserve(comp, needQty);
+            if (!ok) {
+                reservedAll = false;
+                System.out.println("Failed to reserve " + needQty + " of " + comp.getName() + ". Not enough available stock.");
+                // rollback
+                for (Map.Entry<Product, Integer> r : needed.entrySet()) {
+                    if (r.getKey().equals(comp)) break;
+                    warehouse.releaseReserved(r.getKey(), r.getValue());
+                }
+                break;
+            } else {
+                wo.getReservedComponents().put(comp, needQty);
+            }
+        }
+
+        if (reservedAll) {
+            wo.setStatus(WorkOrderStatus.RESERVED);
+            System.out.println("Work Order created and materials reserved: WO#" + wo.getId());
+        } else {
+            wo.setStatus(WorkOrderStatus.CREATED);
+            System.out.println("Work Order created but reservation failed. Status=CREATED");
+        }
+        workOrders.put(wo.getId(), wo);
+    }
+
+    private static void issueMaterials() {
+        WorkOrder wo = chooseWorkOrder();
+        if (wo == null) return;
+        if (wo.getStatus() != WorkOrderStatus.RESERVED) {
+            System.out.println("Materials can only be issued if WO is in RESERVED status. Current: " + wo.getStatus());
+            return;
+        }
+        // Issue exactly the reserved amounts (for simplicity)
+        MaterialIssue mi = new MaterialIssue(transIdSeq++, LocalDateTime.now(), warehouse, wo);
+        boolean allIssued = true;
+        for (Map.Entry<Product,Integer> entry : wo.getReservedComponents().entrySet()) {
+            Product p = entry.getKey();
+            int qty = entry.getValue();
+            boolean ok = warehouse.issue(p, qty); // removes from stock and releases reserved
+            if (!ok) {
+                allIssued = false;
+                System.out.println("Failed to issue " + qty + " of " + p.getName());
+            } else {
+                mi.getIssuedQuantities().put(p, qty);
+            }
+        }
+        if (!mi.getIssuedQuantities().isEmpty()) {
+            wo.getMaterialIssues().add(mi);
+            System.out.println("Material issue created (id=" + mi.getId() + "). Issued materials:");
+            mi.printIssuedList();
+            wo.setStatus(WorkOrderStatus.ISSUED);
+            System.out.println("Work order status set to ISSUED.");
+        } else {
+            System.out.println("Nothing was issued.");
+        }
+    }
+
+    private static void reportProduction() {
+        WorkOrder wo = chooseWorkOrder();
+        if (wo == null) return;
+        if (wo.getStatus() != WorkOrderStatus.ISSUED && wo.getStatus() != WorkOrderStatus.IN_PRODUCTION) {
+            System.out.println("Production can only be reported if materials have been issued. Current: " + wo.getStatus());
+            return;
+        }
+        System.out.print("Produced quantity (finished good units): ");
+        int produced = Integer.parseInt(scanner.nextLine().trim());
+        System.out.print("Scrap quantity: ");
+        int scrap = Integer.parseInt(scanner.nextLine().trim());
+
+        // Validate: cannot produce more than issued allows (simple check)
+        Map<Product, Integer> totalIssued = wo.totalIssuedComponents();
+        Map<Product, Integer> requiredForProduced = wo.getBOM().totalComponentsFor(produced);
+        boolean enough = true;
+        for (Map.Entry<Product,Integer> req : requiredForProduced.entrySet()) {
+            Product comp = req.getKey();
+            int needed = req.getValue();
+            int issuedQty = totalIssued.getOrDefault(comp, 0);
+            if (issuedQty < needed) {
+                enough = false;
+                System.out.println("Not enough issued " + comp.getName() + ". Needed=" + needed + ", Issued=" + issuedQty);
+            }
+        }
+        if (!enough) {
+            System.out.println("Production cannot be reported because not enough materials were issued.");
+            return;
+        }
+
+        // Create production report: components already reduced at issue time; finished goods are received into warehouse
+        ProductionReport pr = new ProductionReport(transIdSeq++, LocalDateTime.now(), warehouse, wo, produced, scrap);
+        warehouse.receive(wo.getBOM().getFinishedProduct(), produced);
+        wo.getProductionReports().add(pr);
+        wo.setStatus(produced >= wo.getQuantity() ? WorkOrderStatus.COMPLETED : WorkOrderStatus.IN_PRODUCTION);
+        System.out.println("Production reported. Received " + produced + " units of " + wo.getBOM().getFinishedProduct().getName());
+        System.out.println("Work order status now: " + wo.getStatus());
+    }
+
+    private static void stockSummary() {
+        System.out.println("--- Stock Summary for warehouse: " + warehouse.getName() + " ---");
+        warehouse.printStockSummary();
+    }
+
+    private static void listWorkOrders() {
+        if (workOrders.isEmpty()) { System.out.println("No work orders."); return; }
+        System.out.println("--- Work Orders ---");
+        for (WorkOrder w : workOrders.values()) {
+            System.out.println(w.briefString());
+            if (!w.getMaterialIssues().isEmpty()) {
+                System.out.println("  Material Issues:");
+                for (MaterialIssue mi : w.getMaterialIssues()) mi.printIssuedList();
+            }
+            if (!w.getProductionReports().isEmpty()) {
+                System.out.println("  Production Reports:");
+                for (ProductionReport pr : w.getProductionReports()) pr.printSummary();
+            }
+        }
+    }
+
+    private static WorkOrder chooseWorkOrder() {
+        if (workOrders.isEmpty()) { System.out.println("No work orders."); return null; }
+        System.out.println("Available Work Orders:");
+        workOrders.values().forEach(w -> System.out.println(w.briefString()));
+        System.out.print("Enter WO id: ");
+        int id = Integer.parseInt(scanner.nextLine().trim());
+        WorkOrder wo = workOrders.get(id);
+        if (wo == null) System.out.println("Invalid WO id.");
+        return wo;
+    }
+
+    // ---------- Sample data ----------
+    private static void seedSampleData() {
+        Product p1 = new Product(productIdSeq++, "Widget", "W-100", "Finished widget");
+        Product p2 = new Product(productIdSeq++, "Bolt", "C-101", "Bolt component");
+        Product p3 = new Product(productIdSeq++, "Plate", "C-102", "Plate component");
+        products.put(p1.getId(), p1);
+        products.put(p2.getId(), p2);
+        products.put(p3.getId(), p3);
+
+        warehouse.receive(p1, 10); // finished goods initial
+        warehouse.receive(p2, 200);
+        warehouse.receive(p3, 100);
+
+        BOM bom = new BOM(bomIdSeq++, p1);
+        bom.addItem(new BOMItem(p2, 4)); // 4 bolts per widget
+        bom.addItem(new BOMItem(p3, 2)); // 2 plates per widget
+        boms.put(bom.getId(), bom);
+
+        System.out.println("Sample data seeded (3 products, 1 BOM, stock added).");
+    }
+
+    // ============================
+    // ---------- Classes ----------
+    // ============================
+
+    // Product
+    static class Product {
+        private final int id;
+        private String name;
+        private String sku;
+        private String description;
+
+        public Product(int id, String name, String sku, String desc) {
+            this.id = id; this.name = name; this.sku = sku; this.description = desc;
+        }
+        public int getId() { return id; }
+        public String getName() { return name; }
+        public String toString(){ return id + ": " + name + " (SKU:" + sku + ")"; }
+    }
+
+    // BOM
+    static class BOM {
+        private final int id;
+        private final Product finishedProduct;
+        private final List<BOMItem> items = new ArrayList<>();
+
+        public BOM(int id, Product finishedProduct) {
+            this.id = id; this.finishedProduct = finishedProduct;
+        }
+        public int getId(){ return id; }
+        public Product getFinishedProduct(){ return finishedProduct; }
+        public void addItem(BOMItem i){ items.add(i); }
+        public List<BOMItem> getItems(){ return items; }
+
+        // returns map of component -> total qty needed for given finished qty
+        public Map<Product,Integer> totalComponentsFor(int finishedQty) {
+            Map<Product,Integer> m = new HashMap<>();
+            for (BOMItem it : items) {
+                m.put(it.getComponent(), it.getQtyPerUnit() * finishedQty);
+            }
+            return m;
+        }
+
+        public String briefString() {
+            return "BOM#" + id + " -> " + finishedProduct.getName() + " (components=" + items.size() + ")";
+        }
+        public String toString(){
+            StringBuilder sb = new StringBuilder();
+            sb.append("BOM#").append(id).append(" for ").append(finishedProduct.getName()).append("\n");
+            for (BOMItem it : items) sb.append("  - ").append(it.getComponent().getName()).append(": ").append(it.getQtyPerUnit()).append("\n");
+            return sb.toString();
+        }
+    }
+
+    // BOMItem
+    static class BOMItem {
+        private final Product component;
+        private final int qtyPerUnit;
+        public BOMItem(Product component, int qtyPerUnit) {
+            this.component = component; this.qtyPerUnit = qtyPerUnit;
+        }
+        public Product getComponent(){ return component; }
+        public int getQtyPerUnit(){ return qtyPerUnit; }
+    }
+
+    // WorkOrderStatus
+    enum WorkOrderStatus { CREATED, RESERVED, ISSUED, IN_PRODUCTION, COMPLETED, CANCELLED }
+
+    // WorkOrder
+    static class WorkOrder {
+        private final int id;
+        private final BOM bom;
+        private final int quantity;
+        private WorkOrderStatus status = WorkOrderStatus.CREATED;
+        private final Map<Product,Integer> reservedComponents = new HashMap<>();
+        private final List<MaterialIssue> materialIssues = new ArrayList<>();
+        private final List<ProductionReport> productionReports = new ArrayList<>();
+
+        public WorkOrder(int id, BOM bom, int quantity) {
+            this.id = id; this.bom = bom; this.quantity = quantity;
+        }
+        public int getId(){ return id; }
+        public BOM getBOM(){ return bom; }
+        public int getQuantity(){ return quantity; }
+        public WorkOrderStatus getStatus(){ return status; }
+        public void setStatus(WorkOrderStatus s){ status = s; }
+        public Map<Product,Integer> getReservedComponents(){ return reservedComponents; }
+        public List<MaterialIssue> getMaterialIssues(){ return materialIssues; }
+        public List<ProductionReport> getProductionReports(){ return productionReports; }
+
+        public Map<Product,Integer> totalIssuedComponents() {
+            Map<Product,Integer> totals = new HashMap<>();
+            for (MaterialIssue mi : materialIssues) {
+                for (Map.Entry<Product,Integer> e : mi.getIssuedQuantities().entrySet()) {
+                    totals.merge(e.getKey(), e.getValue(), Integer::sum);
+                }
+            }
+            return totals;
+        }
+
+        public String briefString() {
+            return "WO#" + id + " [" + bom.getFinishedProduct().getName() + "] qty=" + quantity + " status=" + status;
+        }
+    }
+
+    // InventoryTransaction (abstract) -> demonstrates inheritance/polymorphism
+    static abstract class InventoryTransaction {
+        private final int id;
+        private final LocalDateTime date;
+        private final Warehouse warehouse;
+        public InventoryTransaction(int id, LocalDateTime date, Warehouse wh) {
+            this.id = id; this.date = date; this.warehouse = wh;
+        }
+        public int getId(){ return id; }
+        public LocalDateTime getDate(){ return date; }
+        public Warehouse getWarehouse(){ return warehouse; }
+    }
+
+    // MaterialIssue
+    static class MaterialIssue extends InventoryTransaction {
+        private final WorkOrder workOrder;
+        private final Map<Product,Integer> issuedQuantities = new HashMap<>();
+        public MaterialIssue(int id, LocalDateTime date, Warehouse wh, WorkOrder wo) {
+            super(id, date, wh); this.workOrder = wo;
+        }
+        public WorkOrder getWorkOrder(){ return workOrder; }
+        public Map<Product,Integer> getIssuedQuantities(){ return issuedQuantities; }
+        public int getId(){ return super.getId(); }
+        public void printIssuedList(){
+            System.out.println("    Issue#" + getId() + " (" + getDate() + ")");
+            for (Map.Entry<Product,Integer> e : issuedQuantities.entrySet()) {
+                System.out.println("      - " + e.getKey().getName() + ": " + e.getValue());
+            }
+        }
+    }
+
+    // ProductionReport
+    static class ProductionReport extends InventoryTransaction {
+        private final WorkOrder workOrder;
+        private final int producedQty;
+        private final int scrapQty;
+        public ProductionReport(int id, LocalDateTime date, Warehouse wh, WorkOrder wo, int producedQty, int scrapQty) {
+            super(id, date, wh); this.workOrder = wo; this.producedQty = producedQty; this.scrapQty = scrapQty;
+        }
+        public void printSummary(){
+            System.out.println("    PR#" + getId() + " (" + getDate() + ") produced=" + producedQty + " scrap=" + scrapQty);
+        }
+        public WorkOrder getWorkOrder(){ return workOrder; }
+    }
+
+    // Warehouse
+    static class Warehouse {
+        private final String name;
+        private final Map<Product,Integer> stock = new HashMap<>();
+        private final Map<Product,Integer> reserved = new HashMap<>();
+
+        public Warehouse(String name) { this.name = name; }
+
+        public String getName(){ return name; }
+
+        // available = stock - reserved
+        public synchronized int available(Product p) {
+            return stock.getOrDefault(p,0) - reserved.getOrDefault(p,0);
+        }
+
+        // receive (increase stock)
+        public synchronized void receive(Product p, int qty) {
+            stock.merge(p, qty, Integer::sum);
+        }
+
+        // reserve (increase reserved, but must ensure available >= qty)
+        public synchronized boolean reserve(Product p, int qty) {
+            if (available(p) >= qty) {
+                reserved.merge(p, qty, Integer::sum);
+                return true;
+            }
+            return false;
+        }
+
+        // releaseReserved (decrease reserved)
+        public synchronized boolean releaseReserved(Product p, int qty) {
+            int r = reserved.getOrDefault(p,0);
+            if (r < qty) return false;
+            reserved.put(p, r - qty);
+            return true;
+        }
+
+        // issue (finalize reserved into issued -> we reduce stock and reserved)
+        // this method will reduce stock by qty and reduce reserved by qty.
+        public synchronized boolean issue(Product p, int qty) {
+            int r = reserved.getOrDefault(p, 0);
+            int s = stock.getOrDefault(p, 0);
+            if (r < qty) {
+                // allow issuing without reservation only if enough stock and treat as direct issue (not recommended)
+                if (s >= qty) {
+                    stock.put(p, s - qty);
+                    return true;
+                }
+                return false;
+            }
+            if (s < qty) return false;
+            reserved.put(p, r - qty);
+            stock.put(p, s - qty);
+            return true;
+        }
+
+        // print stock & reserved
+        public synchronized void printStockSummary() {
+            System.out.printf("%-6s %-20s %-8s %-8s %-8s\n", "PID", "Product", "Stock", "Reserved", "Available");
+            for (Product p : stock.keySet()) {
+                int s = stock.getOrDefault(p, 0);
+                int r = reserved.getOrDefault(p, 0);
+                int a = s - r;
+                System.out.printf("%-6d %-20s %-8d %-8d %-8d\n", p.getId(), p.getName(), s, r, a);
+            }
+        }
+    }
+}
